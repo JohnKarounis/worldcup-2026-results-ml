@@ -1,0 +1,17 @@
+name: worldcup-results
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pandas
+  - numpy
+  - scipy
+  - statsmodels
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - jupyter
+  - ipykernel
+  - xgboost
+  - lightgbm
+  - catboost
