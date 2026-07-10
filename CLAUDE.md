@@ -33,11 +33,25 @@ Join key: `(date, home_team, away_team)`.
 | Model | Notebook | RPS | Notes |
 |-------|----------|-----|-------|
 | Naive base rates | — | 0.227 | Floor |
-| **Dixon-Coles** | `03_dixon_coles` | **0.1646** | Winner. Poisson attack/defense, ξ=0.2, α=1e-05, ρ=0 |
 | Elo | `04_elo` | 0.1695 | Walk-forward, K=30, D=150, home_bonus=50 |
-| Feature ensemble | `05_ensemble` | TBD | In progress |
+| Feature ensemble (plain avg of 6 tuned learners) | `05_ensemble` | 0.1674 | XGB/LGB/CB/HGB/RF/GLM, Optuna-tuned |
+| Dixon-Coles | `03_dixon_coles` | 0.1646 | Poisson attack/defense, ξ=0.2, α=1e-05, ρ=0 |
+| **Blend (50/50 ensemble avg + DC)** | `05_ensemble` | **0.1640** | Winner. Match model for the simulator. |
 
-**Decision:** Dixon-Coles is the match model. Elo is an honest baseline that lost on evidence.
+**Decision:** the 50/50 blend of the plain-averaged ensemble and Dixon-Coles is the match model
+fed to the Monte Carlo simulator. DC alone lost by 0.0006 but is still the strongest single
+model; the ensemble adds a small amount of complementary signal (form/rest/H2H-based patterns
+vs pure attack/defense structure).
+
+### Why plain average, not a fitted meta
+
+A stacking meta (`PoissonRegressor` on OOF predictions from time-ordered 3-fold expanding-window
+CV) was built and tuned via Optuna. **It lost cleanly to the plain average** (0.1761 vs 0.1674)
+even with regularization pushed to zero. Root cause: the base learners were tuned to minimize
+eval RPS, so their eval-time predictions carry an optimistic bias that plain averaging
+preserves; the meta was trained on unbiased OOF λ's with a different noise structure than the
+eval-time λ's it's scored on. Classic small-data stacking outcome. Same applies to the final
+DC+ensemble blend — a 2-feature fitted meta wasn't attempted; 50/50 wins.
 
 ---
 
@@ -48,16 +62,63 @@ Join key: `(date, home_team, away_team)`.
 - λ → Poisson PMF → scoreline matrix → W/D/L probabilities.
 - Scorelines needed (not just W/D/L) because the 48-team format resolves on goal difference.
 
-### Feature-based ensemble (05_ensemble, in progress)
-- **As-of Elo** — pre-update rating logged per match, no leakage.
-- **Rolling form** — `shift(1).rolling(5).mean()` of goals scored/conceded per team.
-- Planned: rest days, H2H, tournament tier.
-- Base learners: XGBoost, LightGBM, CatBoost, HistGradientBoosting (all `objective='poisson'`).
-- Stack with penalized Poisson meta (same as main CLAUDE.md §4.3).
+### Feature-based ensemble (`05_ensemble`, complete)
 
-### Monte Carlo simulator (planned)
-- Sample scorelines from λ's → group tables → advancement (top 2 + 8 best 3rd) → knockouts.
+**Features (all leakage-safe / as-of):**
+- **As-of Elo** — K=30, base=1500. Recorded pre-update.
+- **Rolling form** — `shift(1).rolling(5).mean()` of goals scored/conceded per team.
+- **Rest days** — `groupby('team')['date'].diff().dt.days`.
+- **Tournament tier** — ordinal (Friendly=0, Qualifier=1, Continental=2, WC=3).
+- **Head-to-head** — matches played + goal difference from home team's perspective, running
+  dicts keyed by `tuple(sorted([home, away]))` with sign-flip logic.
+
+**Long-format reshape** — each match becomes 2 rows (home-attacker / away-attacker) so one
+Poisson model learns attack and defense symmetrically. Doubles training rows (~38k → ~78k).
+
+**Base learners (6, all Poisson objective):**
+XGBoost, LightGBM, CatBoost, HistGradientBoosting, RandomForest, PoissonRegressor (GLM).
+The 4 boosters + RF eat features raw; the GLM needs a `ColumnTransformer` pipeline
+(median-impute, StandardScaler on numerics, OneHotEncoder on `tournament_tier`, passthrough
+on `neutral`/`is_home`). The GLM is included specifically for **decorrelation** — pairwise λ
+correlations across the 6 landed at 0.87–0.99 (GLM the biggest outlier), enough for stacking
+to be well-posed.
+
+**Tuning — Optuna TPE per learner** (20 trials each, seed=42, `direction='minimize'` on eval
+RPS). Recency decay `ξ` (search range 0.01→0.1) tuned *jointly* with every learner's tree/reg
+knobs, applied as `sample_weight = exp(-ξ * age_years)`. Booster n_estimators handled via
+early stopping on an inner-val slice (last 6 months of `long_train`, from `2023-07-01`);
+`best_iteration` saved as `trial.user_attrs['best_iteration']` and reused frozen at refit.
+
+**Rule enforced:** `study.best_params.copy()` is the *only* source of truth for refit configs
+— hand-rounding cost XGB 0.0002 RPS the first time (log-scaled `reg_alpha=0.00891` → 0.008 is
+~10% off) and it's fully reproducible seed-scatter noise otherwise.
+
+**Individual tuned RPS on eval:**
+CB 0.1679, LGB 0.1679, XGB 0.1678, HGB 0.1681, RF 0.1680, GLM 0.1689 → plain average 0.1674.
+
+**Stacking layer (built and rejected):** 3-fold expanding-window OOF (2008-2013, 2013-2018,
+2018-2023) with pre-2008 kept as always-available training history. Meta = `PoissonRegressor`
+with L2, trained on OOF λ's, scored on eval. Never beat the plain average.
+
+### Blend layer (final match model)
+Simple 50/50 blend of the ensemble's plain-average λ with Dixon-Coles' train-only λ on eval.
+DC's eval predictions are cached at `data/interim/dc_eval_lambda.npy` from notebook 03. This
+is the λ source for the Monte Carlo simulator.
+
+### Deployed models (train + eval refit)
+Once eval had done its job, each tuned learner was **refit on `pre_wc_df` (train + eval
+combined)** to use every available match for actual 2026 predictions. Saved as
+`models/{name}_deployed.joblib` (gitignored). The corresponding Optuna study objects are also
+persisted (`models/study_{name}.joblib`) so a fresh session can skip the ~1.5h of retuning by
+loading them and replaying `best_params` / `best_trial.user_attrs`.
+
+Also saved: `models/{name}_tuned.joblib` (train-only fits) for reproducibility of the RPS
+numbers reported above.
+
+### Monte Carlo simulator (`06_monte_carlo`, in progress)
+- Sample scorelines from the blend λ's → group tables → advancement (top 2 + 8 best 3rd) → knockouts.
 - ~50k iterations → tournament probabilities.
+- Not yet built.
 
 ---
 
@@ -65,8 +126,19 @@ Join key: `(date, home_team, away_team)`.
 
 - **RPS** (ranked probability score) — ordinal-aware, the football standard. Also log loss, Brier.
 - **Time-ordered / walk-forward only.** No random K-fold (leakage).
-- Train: pre-2024. Eval: 2024→pre-WC-2026 (WC excluded). WC 2026: held aside.
-- Always compare against baselines (naive, DC, Elo, bookmaker odds if available).
+- **Three-tier split**, boundaries mutually exclusive:
+  - `train_df`: matches before 2024-01-01.
+  - `eval_df`: 2024-01-01 → pre-WC-2026 (WC excluded). Tuning + selection bench.
+  - `wc2026_df`: the actual World Cup matches. **Sole test set**, held aside.
+- **Booster tuning** additionally carves an **inner_val** (last 6 months of `train_df`, from
+  `2023-07-01`) for early stopping — Optuna scores trials on `eval_df` while early stopping
+  watches `inner_val`. `eval_df` is never mixed into training.
+- **RandomForest** has no early stopping — `n_estimators` tuned directly by Optuna.
+- **HistGradientBoosting** can't accept an external `eval_set` — early stopping disabled,
+  `max_iter` tuned directly.
+- **PoissonRegressor (GLM)** is fit inside a `Pipeline` with a `ColumnTransformer` — sample
+  weights forwarded via `glm__sample_weight` kwarg.
+- Always compare against baselines (naive, Elo, DC, plain average).
 
 ---
 
@@ -80,18 +152,27 @@ worldcup-2026-results-ml/
 ├── environment.yml        ← conda env: worldcup-results, python 3.11
 ├── data/                  ← GITIGNORED (licensing + bloat)
 │   ├── raw/               ← results.csv, shootouts.csv, goalscorers.csv
-│   └── interim/           ← results_clean.parquet
+│   └── interim/           ← results_clean.parquet, dc_eval_lambda.npy,
+│                            model_df_featured.parquet
+├── models/                ← GITIGNORED (large)
+│   ├── {name}_tuned.joblib     ← 6 tuned learners fit on train only
+│   ├── {name}_deployed.joblib  ← 6 tuned learners refit on train + eval
+│   └── study_{name}.joblib     ← Optuna study objects for reload-skip-retune
+├── src/
+│   └── evaluation.py      ← ranked_probability_score, rps_from_lambdas
 └── notebooks/
     ├── 01_data_cleaning.ipynb   ← load, clean, save parquet
     ├── 02_eda.ipynb             ← Poisson justified, friendly vs competitive, neutral handling
-    ├── 03_dixon_coles.ipynb     ← Model 1: Poisson attack/defense, RPS 0.1646
+    ├── 03_dixon_coles.ipynb     ← Model 1: Poisson attack/defense, RPS 0.1646, saves dc_eval_lambda.npy
     ├── 04_elo.ipynb             ← Model 2: Elo → λ → scoreline, RPS 0.1695
-    └── 05_ensemble.ipynb        ← Model 3: feature-based boosters (in progress)
+    ├── 05_ensemble.ipynb        ← Model 3: 6-learner ensemble + blend with DC, RPS 0.1640
+    └── 06_monte_carlo.ipynb     ← Simulator (in progress)
 ```
 
 ## Conventions
 
 - **Data is gitignored.** Publish code + results only. Anyone re-runs on their own copy.
+- **Models are gitignored** (`models/`) — pickles can be tens of MB (RF the worst).
 - **No lookahead.** All features computed as-of match date (pre-update Elo, shifted rolling form).
 - **Secrets never committed.** No API keys in this project (dataset is public).
 - **Environment:** Windows + Anaconda + VS Code, conda env `worldcup-results` (Python 3.11).
@@ -102,13 +183,19 @@ worldcup-2026-results-ml/
 
 ## Key functions (cross-notebook)
 
-- `reshape_to_long(df)` — match → 2 rows (attack/defend perspective). Used in DC model + eval.
-- `fit_poisson_model(df, alpha, sample_weight)` — ColumnTransformer + PoissonRegressor pipeline.
+- `reshape_to_long(df)` — match → 2 rows (attack/defend perspective). DC model + its eval loop.
+- `reshape_to_long_training(df)` — same idea but carrying engineered strength/form features
+  (used by the ensemble). Sign-flips `h2h_goal_diff` on the away-attacker row.
+- `fit_poisson_model(df, alpha, sample_weight)` — ColumnTransformer + PoissonRegressor pipeline (DC).
 - `predict_match(model, home, away, neutral, max_goals)` — two λ's → scoreline matrix → W/D/L.
-- `ranked_probability_score(predicted_probs, actual_outcome)` — cumsum-based RPS.
-- `evaluate_model(model, eval_df, rho, max_goals)` — batched predict, per-match RPS.
-- `add_elo_features(matches, k, base_rating)` — as-of Elo (05_ensemble).
-- `reshape_to_long_format(df)` — per-team table for rolling form (05_ensemble).
+- `add_elo_features(matches, k, base_rating)` — as-of Elo (`05_ensemble`).
+- `add_h2h_features(matches)` — running H2H count + goal diff (`05_ensemble`).
+- `fit_cb / fit_lgb / fit_xgb / fit_hgb / fit_rf / fit_glm(X, y, w)` — one per base learner,
+  each reads the tuned config from its `study_*` object (no rounding).
+- `ranked_probability_score(predicted_probs, actual_outcome)` — cumsum-based RPS (`src/evaluation.py`).
+- `rps_from_lambdas(lambda_vec, df, max_goals=10)` — full λ → scoreline → W/D/L → mean RPS pipeline;
+  expects `lambda_vec` shape `(2n,)` (home half then away half in df order). Single source of
+  truth for the RPS-from-λ boilerplate that was previously duplicated across cells (`src/evaluation.py`).
 
 ---
 
@@ -118,9 +205,9 @@ worldcup-2026-results-ml/
 2. ~~EDA~~ ✓
 3. ~~Dixon-Coles model~~ ✓ (RPS 0.1646)
 4. ~~Elo model~~ ✓ (RPS 0.1695)
-5. **Feature ensemble** ← current (features in progress)
-6. Monte Carlo simulator
-7. 2026 live forecast
+5. ~~Feature ensemble + DC blend~~ ✓ (RPS 0.1640 — winner)
+6. **Monte Carlo simulator** ← current
+7. 2026 live forecast (in-tournament conditioning + Bayesian shrinkage update layer)
 
 ---
 
