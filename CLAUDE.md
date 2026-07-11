@@ -115,10 +115,73 @@ loading them and replaying `best_params` / `best_trial.user_attrs`.
 Also saved: `models/{name}_tuned.joblib` (train-only fits) for reproducibility of the RPS
 numbers reported above.
 
-### Monte Carlo simulator (`06_monte_carlo`, in progress)
-- Sample scorelines from the blend λ's → group tables → advancement (top 2 + 8 best 3rd) → knockouts.
-- ~50k iterations → tournament probabilities.
-- Not yet built.
+### Monte Carlo simulator (`06_monte_carlo`, complete)
+
+**State snapshot (`build_team_state`, `build_h2h_state`)** — walk `pre_wc_df`
+chronologically, freeze end-of-history Elo / rolling form / last-match date per team,
+and running H2H counts + goal-diff-sums per pair. Feeds the fixture-level λ predictor.
+
+**Fixture λ predictor (`predict_blend_lambdas`)** — given (home, away, neutral, tier,
+date), builds the same long-format 2-row feature frame the models were trained on,
+averages the 6 tuned boosters, blends 50/50 with DC → `(λ_home, λ_away)`. Stateless
+— caller supplies the frozen state dicts. Score-time symmetry: same call gives same
+λ regardless of team order (frozenset-keyed cache in the simulator).
+
+**λ cache** — precompute λ for all `C(48,2) = 1128` possible pairings once
+(neutral, tier=3, mid-July date). Simulator then does dict lookups only, not model
+calls. Reduces 50k-iteration cost from hours to seconds.
+
+**Group draw derivation** — reconstruct the 12 groups from `wc2026_df`'s first 72
+matches (each team's group = itself + its 3 group-stage opponents). Anchor-based
+relabel to official FIFA letters so knockout bracket wiring is deterministic across
+kernel restarts (set-iteration order is hash-randomized).
+
+**Tournament sim (`simulate_tournament`)**: 12 groups × 6 matches → standings sorted
+by pts / GD / GF (FIFA tiebreak) → top 2 per group direct + 8 best 3rd-placed → 32 R32
+qualifiers → 5-round bracket (R32/R16/QF/SF/F). Each knockout match: sample two Poisson
+draws; draws resolved by a 50/50 shootout.
+
+**Path 1 — pre-tournament sim (50k iterations, seed=42):**
+
+| Team | P(champion) |
+|------|-------------|
+| Argentina | 12.0% |
+| Spain | 12.0% |
+| Brazil | 9.2% |
+| France | 7.7% |
+| England | 7.2% |
+| Portugal | 6.7% |
+| Germany | 5.8% |
+| Netherlands | 4.9% |
+| Colombia | 4.6% |
+| Belgium | 4.1% |
+
+Top 6 sum to ~54.9%. Argentina/Spain tie matches their Elo tie (2043 vs 2039).
+Nothing absurd — no minnow above 3.5%, no strong nation missing.
+
+**Path 2 — live conditioning (as of 2026-07-11, 500k iterations):**
+
+Tournament state: France beat Morocco, Spain beat Belgium (both in SF). Norway–England
+and Argentina–Switzerland still to play; SF1 = France vs Spain; SF2 = QF3 winner vs
+QF4 winner. Only 6 possible champions:
+
+| Team | P(champion) |
+|------|-------------|
+| Spain | 31.2% |
+| France | 23.5% |
+| Argentina | 22.5% |
+| England | 15.3% |
+| Norway | 4.0% |
+| Switzerland | 3.6% |
+
+Spain leads because they've already booked the SF (skips a QF coinflip) and Elo-tie
+Argentina still has to survive Switzerland.
+
+**Punts noted for v2:**
+- Host advantage in group games (USA/CAN/MEX at home, not neutral)
+- Real FIFA R32 bracket lookup (currently random-paired among 32 qualifiers)
+- Extra time before penalties (collapsed 90+ET → shootout coinflip)
+- `team_state` frozen through the tournament (no rolling Elo/form updates as sim progresses)
 
 ---
 
@@ -166,7 +229,7 @@ worldcup-2026-results-ml/
     ├── 03_dixon_coles.ipynb     ← Model 1: Poisson attack/defense, RPS 0.1646, saves dc_eval_lambda.npy
     ├── 04_elo.ipynb             ← Model 2: Elo → λ → scoreline, RPS 0.1695
     ├── 05_ensemble.ipynb        ← Model 3: 6-learner ensemble + blend with DC, RPS 0.1640
-    └── 06_monte_carlo.ipynb     ← Simulator (in progress)
+    └── 06_monte_carlo.ipynb     ← Simulator: state snapshot + λ predictor + Path 1 + Path 2
 ```
 
 ## Conventions
@@ -190,6 +253,12 @@ worldcup-2026-results-ml/
 - `predict_match(model, home, away, neutral, max_goals)` — two λ's → scoreline matrix → W/D/L.
 - `add_elo_features(matches, k, base_rating)` — as-of Elo (`05_ensemble`).
 - `add_h2h_features(matches)` — running H2H count + goal diff (`05_ensemble`).
+- `build_team_state / build_h2h_state(matches)` — end-of-history snapshots feeding the
+  simulator's fixture-level λ predictor (`06_monte_carlo`).
+- `predict_blend_lambdas(...)` — stateless fixture λ producer: builds the 2-row long
+  format, averages 6 boosters + blends 50/50 with DC (`06_monte_carlo`).
+- `simulate_group / simulate_group_phase / simulate_knockout_match / simulate_bracket /
+  simulate_tournament(...)` — the Monte Carlo stack (`06_monte_carlo`).
 - `fit_cb / fit_lgb / fit_xgb / fit_hgb / fit_rf / fit_glm(X, y, w)` — one per base learner,
   each reads the tuned config from its `study_*` object (no rounding).
 - `ranked_probability_score(predicted_probs, actual_outcome)` — cumsum-based RPS (`src/evaluation.py`).
@@ -206,8 +275,8 @@ worldcup-2026-results-ml/
 3. ~~Dixon-Coles model~~ ✓ (RPS 0.1646)
 4. ~~Elo model~~ ✓ (RPS 0.1695)
 5. ~~Feature ensemble + DC blend~~ ✓ (RPS 0.1640 — winner)
-6. **Monte Carlo simulator** ← current
-7. 2026 live forecast (in-tournament conditioning + Bayesian shrinkage update layer)
+6. ~~Monte Carlo simulator~~ ✓ (Path 1 pre-tournament + Path 2 live-conditioning)
+7. **2026 live forecast** ← current (Path 2 done; Bayesian shrinkage update layer still pending)
 
 ---
 
