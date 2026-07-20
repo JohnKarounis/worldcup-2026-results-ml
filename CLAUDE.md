@@ -183,6 +183,18 @@ Argentina still has to survive Switzerland.
 - Extra time before penalties (collapsed 90+ET → shootout coinflip)
 - `team_state` frozen through the tournament (no rolling Elo/form updates as sim progresses)
 
+### Final result — Spain won the 2026 World Cup
+
+Model called **all three knockout matchups** it was consulted on (Path 2 + single-match reports):
+
+| Match | Model pick | W% | Actual |
+|---|---|---|---|
+| SF: France vs Spain | Spain | 54.6% | Spain won ✓ |
+| SF: Argentina vs England | Argentina | 55.3% | Argentina won ✓ |
+| Final: Spain vs Argentina | Spain | 50.5% | Spain won ✓ |
+
+Final was effectively a coinflip in the model (Spain 50.5% / Argentina 49.5%) — very close reflects the Elo tie (2039 vs 2043) with Spain slightly favored by DC/form components in the blend. All three predictions correct, headlined by Spain lifting the trophy.
+
 ---
 
 ## Evaluation methodology

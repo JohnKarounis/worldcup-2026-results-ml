@@ -56,6 +56,18 @@ Refreshed with real tournament results conditioned in: France in SF (beat Morocc
 
 Spain leads because they've already booked the SF, so they skip a QF coinflip that Argentina/England still face.
 
+## Final result — Spain won 🏆
+
+Model called **all three knockout matchups** it was consulted on:
+
+| Match | Model pick | W% | Actual |
+|---|---|---|---|
+| SF: France vs Spain | Spain | 54.6% | Spain won ✓ |
+| SF: Argentina vs England | Argentina | 55.3% | Argentina won ✓ |
+| Final: Spain vs Argentina | Spain | 50.5% | **Spain won ✓** |
+
+The Final was an effective coinflip in the model (Spain 50.5% / Argentina 49.5%), reflecting the near-tie in Elo (2039 vs 2043) with Spain edged slightly ahead by the DC + form components in the blend. Three matchups called, three correct — headlined by Spain lifting the trophy.
+
 ---
 
 ## Methodology
