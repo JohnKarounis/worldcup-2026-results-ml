@@ -222,3 +222,5 @@ __marimo__/
 
 # Trained models
 models/catboost_info/
+catboost_info/
+models/
